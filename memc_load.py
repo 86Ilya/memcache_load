@@ -22,11 +22,12 @@ class Worker(Thread):
         Thread.__init__(self)
         self.queue = queue
         self.daemon = True
+        self.options = options
         self.device_memc = {
-                "idfa": options.idfa,
-                "gaid": options.gaid,
-                "adid": options.adid,
-                "dvid": options.dvid,
+                "idfa": self.options.idfa,
+                "gaid": self.options.gaid,
+                "adid": self.options.adid,
+                "dvid": self.options.dvid,
             }
         self.device_memc_clients = dict()
         for name, addr in self.device_memc.items():
@@ -34,7 +35,7 @@ class Worker(Thread):
 
         self.start()
 
-    def processing(self, filename):
+    def processing(self, filename, dry=False):
         processed = errors = 0
         logging.info('Processing %s' % filename)
         fd = gzip.open(filename)
@@ -53,8 +54,8 @@ class Worker(Thread):
                 errors += 1
                 logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                 continue
-            # ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
-            ok = insert_appsinstalled(memc_client, appsinstalled, False)
+            ok = insert_appsinstalled(memc_client, appsinstalled, dry)
+            # ok = insert_appsinstalled(memc_client, appsinstalled, False)
             if ok:
                 processed += 1
             else:
@@ -78,7 +79,7 @@ class Worker(Thread):
                 job = self.queue.get()
                 if isinstance(job, str) and job == 'quit':
                     break
-                self.processing(job)
+                self.processing(job, self.options.dry)
             finally:
                 self.queue.task_done()
 
@@ -122,12 +123,12 @@ def insert_appsinstalled(memc_client, appsinstalled, dry_run=False):
     try:
         if dry_run:
             logging.debug("%s - %s -> %s" % (memc_client, key, str(ua).replace("\n", " ")))
+            return True
         else:
-            memc_client.set(key, packed)
+            return memc_client.set(key, packed)
     except Exception, e:
         logging.exception("Cannot write to memc %s: %s" % (memc_client, e))
         return False
-    return True
 
 
 def parse_appsinstalled(line):
@@ -150,7 +151,8 @@ def parse_appsinstalled(line):
 
 
 def main(options):
-    pool = ThreadPool(4, options)
+    max_threads = options.threads
+    pool = ThreadPool(max_threads, options)
     for fn in glob.iglob(options.pattern):
         pool.add_task(fn)
     pool.wait_completion()
@@ -177,11 +179,12 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
+    op.add_option("--pattern", action="store", default="./data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
+    op.add_option("--threads", action="store", default=4)
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
