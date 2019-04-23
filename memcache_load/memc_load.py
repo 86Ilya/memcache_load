@@ -6,15 +6,34 @@ import sys
 import glob
 import logging
 import collections
+import time
 
 from Queue import Queue
 from threading import Thread
 from optparse import OptionParser
 import appsinstalled_pb2
-import memcache
+# from memcache import Client
+from pylibmc import Client, ConnectionError, ServerDown
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+
+TIMEOUT = 15
+MAXATTEMPTS = 5
+
+
+def reconnect(func, *args):
+    res = None
+    for _ in range(MAXATTEMPTS):
+        try:
+            res = func(*args)
+        except Exception, e:
+            print(e.__class__)
+
+        if res:
+            return res
+        time.sleep(TIMEOUT)
+    raise Exception('Max attempts exceeded while trying to reconnect in {}'.format(func.__name__))
 
 
 class Worker(Thread):
@@ -31,47 +50,42 @@ class Worker(Thread):
             }
         self.device_memc_clients = dict()
         for name, addr in self.device_memc.items():
-            self.device_memc_clients[name] = memcache.Client([addr])
+            self.device_memc_clients[name] = Client([addr])
 
         self.start()
 
     def processing(self, filename, dry=False):
         processed = errors = 0
         logging.info('Processing %s' % filename)
-        fd = gzip.open(filename)
-        for line in fd:
-            line = line.strip()
-            if not line:
-                continue
-            appsinstalled = parse_appsinstalled(line)
-            if not appsinstalled:
-                errors += 1
-                continue
-            # memc_addr = self.device_memc.get(appsinstalled.dev_type)
-            memc_client = self.device_memc_clients.get(appsinstalled.dev_type, None)
 
-            if not memc_client:
-                errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                continue
-            ok = insert_appsinstalled(memc_client, appsinstalled, dry)
-            # ok = insert_appsinstalled(memc_client, appsinstalled, False)
-            if ok:
-                processed += 1
+        with gzip.open(filename) as fd:
+            for line in fd:
+                line = line.strip()
+                if not line:
+                    continue
+                appsinstalled = parse_appsinstalled(line)
+                if not appsinstalled:
+                    errors += 1
+                    continue
+                memc_client = self.device_memc_clients.get(appsinstalled.dev_type, None)
+
+                if not memc_client:
+                    errors += 1
+                    logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+                    continue
+                ok = insert_appsinstalled(memc_client, appsinstalled, dry)
+                if ok:
+                    processed += 1
+                else:
+                    errors += 1
+
+            err_rate = float(errors) / processed
+            if err_rate < NORMAL_ERR_RATE:
+                logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
             else:
-                errors += 1
-        if not processed:
+                logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
             fd.close()
-            dot_rename(self.filename)
-            # continue
-
-        err_rate = float(errors) / processed
-        if err_rate < NORMAL_ERR_RATE:
-            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
-        else:
-            logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
-        fd.close()
-        dot_rename(filename)
+            dot_rename(filename)
 
     def run(self):
         while True:
@@ -125,7 +139,7 @@ def insert_appsinstalled(memc_client, appsinstalled, dry_run=False):
             logging.debug("%s - %s -> %s" % (memc_client, key, str(ua).replace("\n", " ")))
             return True
         else:
-            return memc_client.set(key, packed)
+            return reconnect(memc_client.set, key, packed)
     except Exception, e:
         logging.exception("Cannot write to memc %s: %s" % (memc_client, e))
         return False
@@ -151,7 +165,7 @@ def parse_appsinstalled(line):
 
 
 def main(options):
-    max_threads = options.threads
+    max_threads = int(options.threads)
     pool = ThreadPool(max_threads, options)
     for fn in glob.iglob(options.pattern):
         pool.add_task(fn)
