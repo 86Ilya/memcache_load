@@ -15,44 +15,59 @@ import appsinstalled_pb2
 # from memcache import Client
 from pylibmc import Client, ConnectionError, ServerDown
 
-NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
-TIMEOUT = 15
+NORMAL_ERR_RATE = 0.01
+TIMEOUT = 5
 MAXATTEMPTS = 5
 
 
-def reconnect(func, *args):
-    res = None
-    for _ in range(MAXATTEMPTS):
-        try:
-            res = func(*args)
-        except Exception, e:
-            print(e.__class__)
-
-        if res:
-            return res
-        time.sleep(TIMEOUT)
-    raise Exception('Max attempts exceeded while trying to reconnect in {}'.format(func.__name__))
-
-
 class Worker(Thread):
-    def __init__(self, queue, options):
+    def __init__(self, queue, dry, device_memc, memc_clients):
         Thread.__init__(self)
         self.queue = queue
         self.daemon = True
-        self.options = options
-        self.device_memc = {
-                "idfa": self.options.idfa,
-                "gaid": self.options.gaid,
-                "adid": self.options.adid,
-                "dvid": self.options.dvid,
-            }
-        self.device_memc_clients = dict()
-        for name, addr in self.device_memc.items():
-            self.device_memc_clients[name] = Client([addr])
+        self.dry = dry
+        self.device_memc = device_memc
+        self.device_memc_clients = memc_clients
 
         self.start()
+
+    def insert_appsinstalled(self, memc_client, appsinstalled, dry_run=False):
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+        # @TODO persistent connection
+        # @TODO retry and timeouts!
+        try:
+            if dry_run:
+                logging.debug("%s - %s -> %s" % (memc_client, key, str(ua).replace("\n", " ")))
+                return True
+            else:
+                return self.memc_set(memc_client, key, packed)
+        except Exception, e:
+            logging.exception("Cannot write to memc %s: %s" % (memc_client, e))
+            return False
+
+    def memc_set(self, client, key, value):
+        res = None
+        for _ in range(MAXATTEMPTS):
+            try:
+                res = client.set(key, value)
+            except ServerDown:
+                dev_type = key.split(':')[0]
+                self.device_memc_clients[dev_type] = Client(client.addresses)
+            except ConnectionError:
+                continue
+            if res:
+                return res
+            time.sleep(TIMEOUT)
+        # Remove broken server from dict
+        self.device_memc_clients.pop(dev_type)
+        raise Exception('Max attempts exceeded while trying to connect to {} '.format(self.device_memc[dev_type]))
 
     def processing(self, filename, dry=False):
         processed = errors = 0
@@ -73,14 +88,18 @@ class Worker(Thread):
                     errors += 1
                     logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                     continue
-                ok = insert_appsinstalled(memc_client, appsinstalled, dry)
+                ok = self.insert_appsinstalled(memc_client, appsinstalled, dry)
                 if ok:
                     processed += 1
                 else:
                     errors += 1
+            try:
+                err_rate = float(errors) / processed
+            except ZeroDivisionError:
+                err_rate = float('inf')
 
-            err_rate = float(errors) / processed
             if err_rate < NORMAL_ERR_RATE:
+                logging.debug("processed %s" % processed)
                 logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
             else:
                 logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
@@ -93,7 +112,7 @@ class Worker(Thread):
                 job = self.queue.get()
                 if isinstance(job, str) and job == 'quit':
                     break
-                self.processing(job, self.options.dry)
+                self.processing(job, self.dry)
             finally:
                 self.queue.task_done()
 
@@ -103,11 +122,24 @@ class ThreadPool(object):
     Класс организующий распределение заданий между потоками
     """
 
-    def __init__(self, num_threads, config):
+    def __init__(self, num_threads, options):
         self.num_threads = num_threads
         self.queue = Queue(self.num_threads)
+
+        self.device_memc = {
+                "idfa": options.idfa,
+                "gaid": options.gaid,
+                "adid": options.adid,
+                "dvid": options.dvid,
+            }
+
+        self.device_memc_clients = dict()
+
+        for name, addr in self.device_memc.items():
+            self.device_memc_clients[name] = Client([addr])
+
         for _ in range(num_threads):
-            Worker(self.queue, config)
+            Worker(self.queue, options.dry, self.device_memc, self.device_memc_clients)
 
     def add_task(self, task):
         self.queue.put(task)
@@ -115,7 +147,6 @@ class ThreadPool(object):
     def wait_completion(self):
         for _ in xrange(self.num_threads):
             self.add_task('quit')
-
         self.queue.join()
 
 
@@ -123,26 +154,6 @@ def dot_rename(path):
     head, fn = os.path.split(path)
     # atomic in most cases
     os.rename(path, os.path.join(head, "." + fn))
-
-
-def insert_appsinstalled(memc_client, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_client, key, str(ua).replace("\n", " ")))
-            return True
-        else:
-            return reconnect(memc_client.set, key, packed)
-    except Exception, e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_client, e))
-        return False
 
 
 def parse_appsinstalled(line):
