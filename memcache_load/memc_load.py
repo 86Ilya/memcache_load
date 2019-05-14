@@ -12,8 +12,7 @@ from Queue import Queue
 from threading import Thread
 from optparse import OptionParser
 import appsinstalled_pb2
-# from memcache import Client
-from pylibmc import Client, ConnectionError, ServerDown
+from memcache import Client
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
@@ -40,8 +39,6 @@ class Worker(Thread):
         key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
         ua.apps.extend(appsinstalled.apps)
         packed = ua.SerializeToString()
-        # @TODO persistent connection
-        # @TODO retry and timeouts!
         try:
             if dry_run:
                 logging.debug("%s - %s -> %s" % (memc_client, key, str(ua).replace("\n", " ")))
@@ -57,17 +54,16 @@ class Worker(Thread):
         for _ in range(MAXATTEMPTS):
             try:
                 res = client.set(key, value)
-            except ServerDown:
+            except Exception as error:
                 dev_type = key.split(':')[0]
                 self.device_memc_clients[dev_type] = Client(client.addresses)
-            except ConnectionError:
-                continue
             if res:
                 return res
             time.sleep(TIMEOUT)
         # Remove broken server from dict
         self.device_memc_clients.pop(dev_type)
-        raise Exception('Max attempts exceeded while trying to connect to {} '.format(self.device_memc[dev_type]))
+        raise Exception('Max attempts exceeded while trying to connect to {} with error {}'.format(
+            self.device_memc[dev_type]), error)
 
     def processing(self, filename, dry=False):
         processed = errors = 0
@@ -204,7 +200,7 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default="./data/appsinstalled/*.tsv.gz")
+    op.add_option("--pattern", action="store", default="memcache_load/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
