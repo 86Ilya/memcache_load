@@ -7,12 +7,13 @@ import glob
 import logging
 import collections
 import time
-
-from Queue import Queue
-from threading import Thread
-from optparse import OptionParser
-import appsinstalled_pb2
+import multiprocessing
+from multiprocessing.pool import ThreadPool
+from collections import defaultdict
 from memcache import Client
+from optparse import OptionParser
+
+import appsinstalled_pb2
 
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
@@ -21,52 +22,66 @@ TIMEOUT = 5
 MAXATTEMPTS = 5
 
 
-class Worker(Thread):
-    def __init__(self, queue, dry, device_memc, memc_clients):
-        Thread.__init__(self)
-        self.queue = queue
-        self.daemon = True
+class ProcessedAppsCounter(object):
+    """
+    Class Helper to count errors and processed apps
+    """
+
+    processed_apps = 0
+    errors_apps = 0
+
+    def error(self, count=1):
+        self.errors_apps += count
+
+    def processed(self, count=1):
+        self.processed_apps += count
+
+    def get_processed(self):
+        return self.processed_apps
+
+    def get_errors_rate(self):
+        try:
+            err_rate = float(self.errors_apps) / self.processed_apps
+        except ZeroDivisionError:
+            err_rate = float('inf')
+        return err_rate
+
+
+class Worker(object):
+    """
+    Class used to process files in separate processes
+    """
+
+    def __init__(self, dry, device_memc, memc_clients):
         self.dry = dry
         self.device_memc = device_memc
         self.device_memc_clients = memc_clients
+        # in different processes it will be different objects
+        self.memc_clients_buff = defaultdict(dict)
+        self.memc_clients_buff_size = defaultdict(int)
+        self.memc_clients_processed_apps = defaultdict(int)
+        self.max_threads = 4
+        # this size must be close to useful packet size in network
+        self.buff_max_size = 65000
 
-        self.start()
+    def __call__(self, fn):
+        self.processing(fn, self.dry)
 
-    def insert_appsinstalled(self, memc_client, appsinstalled, dry_run=False):
+    def bufferize_appsinstalled(self, memc_client, appsinstalled):
         ua = appsinstalled_pb2.UserApps()
         ua.lat = appsinstalled.lat
         ua.lon = appsinstalled.lon
         key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
         ua.apps.extend(appsinstalled.apps)
         packed = ua.SerializeToString()
-        try:
-            if dry_run:
-                logging.debug("%s - %s -> %s" % (memc_client, key, str(ua).replace("\n", " ")))
-                return True
-            else:
-                return self.memc_set(memc_client, key, packed)
-        except Exception, e:
-            logging.exception("Cannot write to memc %s: %s" % (memc_client, e))
-            return False
-
-    def memc_set(self, client, key, value):
-        res = None
-        for _ in range(MAXATTEMPTS):
-            try:
-                res = client.set(key, value)
-            except Exception as error:
-                dev_type = key.split(':')[0]
-                self.device_memc_clients[dev_type] = Client(client.addresses)
-            if res:
-                return res
-            time.sleep(TIMEOUT)
-        # Remove broken server from dict
-        self.device_memc_clients.pop(dev_type)
-        raise Exception('Max attempts exceeded while trying to connect to {} with error {}'.format(
-            self.device_memc[dev_type]), error)
+        self.memc_clients_buff_size[memc_client] += len(packed)
+        self.memc_clients_buff[memc_client].update({key: packed})
+        self.memc_clients_processed_apps[memc_client] += 1
+        return self.memc_clients_buff_size[memc_client]
 
     def processing(self, filename, dry=False):
-        processed = errors = 0
+        processed_counter = ProcessedAppsCounter()
+        pool = ThreadPool(self.max_threads)
         logging.info('Processing %s' % filename)
 
         with gzip.open(filename) as fd:
@@ -76,74 +91,42 @@ class Worker(Thread):
                     continue
                 appsinstalled = parse_appsinstalled(line)
                 if not appsinstalled:
-                    errors += 1
+                    processed_counter.error()
                     continue
                 memc_client = self.device_memc_clients.get(appsinstalled.dev_type, None)
 
                 if not memc_client:
-                    errors += 1
+                    processed_counter.error()
                     logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                     continue
-                ok = self.insert_appsinstalled(memc_client, appsinstalled, dry)
-                if ok:
-                    processed += 1
-                else:
-                    errors += 1
-            try:
-                err_rate = float(errors) / processed
-            except ZeroDivisionError:
-                err_rate = float('inf')
 
+                # bufferize content
+                if self.bufferize_appsinstalled(memc_client, appsinstalled) > self.buff_max_size:
+                    processed_counter.processed(count=self.memc_clients_processed_apps[memc_client])
+                    # Get shallow copy
+                    bufferized_dict = self.memc_clients_buff[memc_client].copy()
+                    # Clean original buff
+                    self.memc_clients_buff[memc_client] = dict()
+                    # Reset size buffer
+                    self.memc_clients_buff_size[memc_client] = 0
+                    # Reset processed apps
+                    self.memc_clients_processed_apps[memc_client] = 0
+
+                    # Add task to pool
+                    def to_excecute():
+                        return insert_appsinstalled(memc_client, bufferized_dict, dry, processed_counter)
+                    pool.map(to_excecute, [])
+
+            pool.close()
+            pool.join()
+            err_rate = processed_counter.get_errors_rate()
+            processed = processed_counter.get_processed()
             if err_rate < NORMAL_ERR_RATE:
                 logging.debug("processed %s" % processed)
                 logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
             else:
                 logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
-            fd.close()
-            dot_rename(filename)
-
-    def run(self):
-        while True:
-            try:
-                job = self.queue.get()
-                if isinstance(job, str) and job == 'quit':
-                    break
-                self.processing(job, self.dry)
-            finally:
-                self.queue.task_done()
-
-
-class ThreadPool(object):
-    """
-    Класс организующий распределение заданий между потоками
-    """
-
-    def __init__(self, num_threads, options):
-        self.num_threads = num_threads
-        self.queue = Queue(self.num_threads)
-
-        self.device_memc = {
-                "idfa": options.idfa,
-                "gaid": options.gaid,
-                "adid": options.adid,
-                "dvid": options.dvid,
-            }
-
-        self.device_memc_clients = dict()
-
-        for name, addr in self.device_memc.items():
-            self.device_memc_clients[name] = Client([addr])
-
-        for _ in range(num_threads):
-            Worker(self.queue, options.dry, self.device_memc, self.device_memc_clients)
-
-    def add_task(self, task):
-        self.queue.put(task)
-
-    def wait_completion(self):
-        for _ in xrange(self.num_threads):
-            self.add_task('quit')
-        self.queue.join()
+        dot_rename(filename)
 
 
 def dot_rename(path):
@@ -171,12 +154,48 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
+def insert_appsinstalled(memc_client, bufferized_dict, error_counter, dry_run=False):
+    try:
+        if dry_run:
+            logging.debug("%s -> %s" % (memc_client, bufferized_dict))
+        else:
+            memc_set(memc_client, bufferized_dict)
+
+    except Exception as error:
+        error_counter.error()
+        logging.exception("Cannot write to memc %s: %s" % (memc_client, error))
+
+
+def memc_set(client, key_value):
+    res = None
+    for _ in range(MAXATTEMPTS):
+        try:
+            res = client.set_multi(key_value)
+        except Exception as error:
+            pass
+        if len(res) == 0:
+            return True
+        time.sleep(TIMEOUT)
+    # if we are here then error has occured
+    raise Exception('Max attempts exceeded while trying to connect to {} with error {}'.format(client, error))
+
+
 def main(options):
-    max_threads = int(options.threads)
-    pool = ThreadPool(max_threads, options)
-    for fn in glob.iglob(options.pattern):
-        pool.add_task(fn)
-    pool.wait_completion()
+    max_processes = int(options.processes)
+    device_memc_clients = dict()
+    device_memc = {
+            "idfa": options.idfa,
+            "gaid": options.gaid,
+            "adid": options.adid,
+            "dvid": options.dvid,
+        }
+
+    for name, addr in device_memc.items():
+        device_memc_clients[name] = Client([addr], socket_timeout=TIMEOUT)
+
+    process_pool = multiprocessing.Pool(max_processes)
+    worker = Worker(options.dry, device_memc, device_memc_clients)
+    process_pool.map(worker, [filename for filename in glob.iglob(options.pattern)])
 
 
 def prototest():
@@ -205,7 +224,7 @@ if __name__ == '__main__':
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
-    op.add_option("--threads", action="store", default=4)
+    op.add_option("--processes", action="store", default=4)
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
