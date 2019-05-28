@@ -100,7 +100,7 @@ class Worker(object):
                     logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                     continue
 
-                # bufferize content
+                # bufferize content and check buff size
                 if self.bufferize_appsinstalled(memc_client, appsinstalled) > self.buff_max_size:
                     processed_counter.processed(count=self.memc_clients_processed_apps[memc_client])
                     # Get shallow copy
@@ -111,6 +111,16 @@ class Worker(object):
                     self.memc_clients_buff_size[memc_client] = 0
                     # Reset processed apps
                     self.memc_clients_processed_apps[memc_client] = 0
+
+                    # Add task to pool
+                    def to_excecute():
+                        return insert_appsinstalled(memc_client, bufferized_dict, dry, processed_counter)
+                    pool.map(to_excecute, [])
+
+            # Send tailings from buffers
+            for memc_client, bufferized_dict in self.memc_clients_buff.items():
+                if self.memc_clients_buff_size[memc_client] > 0:
+                    processed_counter.processed(count=self.memc_clients_processed_apps[memc_client])
 
                     # Add task to pool
                     def to_excecute():
