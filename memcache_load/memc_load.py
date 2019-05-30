@@ -52,14 +52,9 @@ class Worker(object):
     Class used to process files in separate processes
     """
 
-    def __init__(self, dry, device_memc, memc_clients):
+    def __init__(self, dry, device_memc):
         self.dry = dry
         self.device_memc = device_memc
-        self.device_memc_clients = memc_clients
-        # in different processes it will be different objects
-        self.memc_clients_buff = defaultdict(dict)
-        self.memc_clients_buff_size = defaultdict(int)
-        self.memc_clients_processed_apps = defaultdict(int)
         self.max_threads = 4
         # this size must be close to useful packet size in network
         self.buff_max_size = 65000
@@ -67,22 +62,30 @@ class Worker(object):
     def __call__(self, fn):
         self.processing(fn, self.dry)
 
-    def bufferize_appsinstalled(self, memc_client, appsinstalled):
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = appsinstalled.lat
-        ua.lon = appsinstalled.lon
-        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-        ua.apps.extend(appsinstalled.apps)
-        packed = ua.SerializeToString()
-        self.memc_clients_buff_size[memc_client] += len(packed)
-        self.memc_clients_buff[memc_client].update({key: packed})
-        self.memc_clients_processed_apps[memc_client] += 1
-        return self.memc_clients_buff_size[memc_client]
-
     def processing(self, filename, dry=False):
         processed_counter = ProcessedAppsCounter()
         pool = ThreadPool(self.max_threads)
+        device_memc_clients = dict()
+        memc_clients_buff = defaultdict(dict)
+        memc_clients_buff_size = defaultdict(int)
+        memc_clients_processed_apps = defaultdict(int)
+
+        def bufferize_appsinstalled(memc_client, appsinstalled):
+            ua = appsinstalled_pb2.UserApps()
+            ua.lat = appsinstalled.lat
+            ua.lon = appsinstalled.lon
+            key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+            ua.apps.extend(appsinstalled.apps)
+            packed = ua.SerializeToString()
+            memc_clients_buff_size[memc_client] += len(packed)
+            memc_clients_buff[memc_client].update({key: packed})
+            memc_clients_processed_apps[memc_client] += 1
+            return memc_clients_buff_size[memc_client]
+
         logging.info('Processing %s' % filename)
+
+        for name, addr in self.device_memc.items():
+            device_memc_clients[name] = Client([addr], socket_timeout=TIMEOUT)
 
         with gzip.open(filename) as fd:
             for line in fd:
@@ -93,7 +96,7 @@ class Worker(object):
                 if not appsinstalled:
                     processed_counter.error()
                     continue
-                memc_client = self.device_memc_clients.get(appsinstalled.dev_type, None)
+                memc_client = device_memc_clients.get(appsinstalled.dev_type, None)
 
                 if not memc_client:
                     processed_counter.error()
@@ -101,16 +104,16 @@ class Worker(object):
                     continue
 
                 # bufferize content and check buff size
-                if self.bufferize_appsinstalled(memc_client, appsinstalled) > self.buff_max_size:
-                    processed_counter.processed(count=self.memc_clients_processed_apps[memc_client])
+                if bufferize_appsinstalled(memc_client, appsinstalled) > self.buff_max_size:
+                    processed_counter.processed(count=memc_clients_processed_apps[memc_client])
                     # Get shallow copy
-                    bufferized_dict = self.memc_clients_buff[memc_client].copy()
+                    bufferized_dict = memc_clients_buff[memc_client].copy()
                     # Clean original buff
-                    self.memc_clients_buff[memc_client] = dict()
+                    memc_clients_buff[memc_client] = dict()
                     # Reset size buffer
-                    self.memc_clients_buff_size[memc_client] = 0
+                    memc_clients_buff_size[memc_client] = 0
                     # Reset processed apps
-                    self.memc_clients_processed_apps[memc_client] = 0
+                    memc_clients_processed_apps[memc_client] = 0
 
                     # Add task to pool
                     def to_excecute():
@@ -118,9 +121,9 @@ class Worker(object):
                     pool.map(to_excecute, [])
 
             # Send tailings from buffers
-            for memc_client, bufferized_dict in self.memc_clients_buff.items():
-                if self.memc_clients_buff_size[memc_client] > 0:
-                    processed_counter.processed(count=self.memc_clients_processed_apps[memc_client])
+            for memc_client, bufferized_dict in memc_clients_buff.items():
+                if memc_clients_buff_size[memc_client] > 0:
+                    processed_counter.processed(count=memc_clients_processed_apps[memc_client])
 
                     # Add task to pool
                     def to_excecute():
@@ -192,7 +195,6 @@ def memc_set(client, key_value):
 
 def main(options):
     max_processes = int(options.processes)
-    device_memc_clients = dict()
     device_memc = {
             "idfa": options.idfa,
             "gaid": options.gaid,
@@ -200,11 +202,9 @@ def main(options):
             "dvid": options.dvid,
         }
 
-    for name, addr in device_memc.items():
-        device_memc_clients[name] = Client([addr], socket_timeout=TIMEOUT)
 
     process_pool = multiprocessing.Pool(max_processes)
-    worker = Worker(options.dry, device_memc, device_memc_clients)
+    worker = Worker(options.dry, device_memc)
     process_pool.map(worker, [filename for filename in glob.iglob(options.pattern)])
 
 
